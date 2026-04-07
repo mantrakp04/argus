@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# bun + npm + pnpm + yarn lockfile churn
+# (bun.lock is committed)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# runtime outputs from the pipeline
+# (these are generated per-PR by the splitter/runner; not source)
+/tmp/
+review-run/
+review-run-*/
+ctx-*.json
+outputs/
+outputs-v2/
+PRELUDE.md
+CALLSITE-AUDIT.md
+PROCESS-REVIEW.md
+final-review*.md
+
+# debug / scratch
+debug-*.ts
+scratch/
+*.log
+
+# editor + OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# env
+.env
+.env.*
+!.env.example
+
+# caches
+.cache/
+.turbo/
+.next/
+coverage/

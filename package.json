@@ -1,0 +1,46 @@
+{
+  "name": "argus",
+  "version": "0.4.0",
+  "type": "module",
+  "description": "Many-eyed PR review pipeline: deep context building (Babel AST graph + Ollama embeddings + workspace resolution) + multi-agent codex review passes + persona-voice synthesis. Bun + TypeScript.",
+  "keywords": [
+    "code-review",
+    "pr-review",
+    "code-context",
+    "ast",
+    "babel",
+    "ollama",
+    "embeddings",
+    "codex",
+    "greptile",
+    "bun",
+    "typescript"
+  ],
+  "homepage": "https://github.com/mantrakp04/argus#readme",
+  "bugs": {
+    "url": "https://github.com/mantrakp04/argus/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mantrakp04/argus.git"
+  },
+  "author": "Mantra Kapoor (https://github.com/mantrakp04)",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "context": "bun run ./index.ts",
+    "split": "bun run ./split.ts",
+    "eval": "bun run ./eval.ts",
+    "review": "bun run ./review.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.25.6",
+    "@babel/traverse": "^7.25.6"
+  },
+  "devDependencies": {
+    "@types/babel__traverse": "^7.20.6",
+    "@types/bun": "latest",
+    "@types/node": "^22.5.0",
+    "typescript": "^5.6.0"
+  }
+}
