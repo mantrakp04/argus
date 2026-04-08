@@ -1,6 +1,6 @@
 {
   "name": "argus",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "Many-eyed PR review pipeline: deep context building (Babel AST graph + Ollama embeddings + workspace resolution) + multi-agent codex review passes + persona-voice synthesis. Bun + TypeScript.",
   "keywords": [
@@ -25,7 +25,7 @@
     "url": "git+https://github.com/mantrakp04/argus.git"
   },
   "author": "Mantra Kapoor (https://github.com/mantrakp04)",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "scripts": {
     "context": "bun run ./index.ts",
     "split": "bun run ./split.ts",

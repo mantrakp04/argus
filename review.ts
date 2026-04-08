@@ -1,18 +1,24 @@
 #!/usr/bin/env bun
 /**
- * review.ts — end-to-end review test using a bundle from index.ts.
+ * review.ts — single-file end-to-end review smoke test using a bundle from index.ts.
  *
  * Usage:
- *   bun run review.ts <bundle.json> [file-path]
- *   bun run review.ts /tmp/ctx-v7.json                      # auto-pick meaty file
- *   bun run review.ts /tmp/ctx-v7.json apps/backend/seed.ts # review a specific file
+ *   bun run review.ts <bundle.json> [file-path] [--worktree <path>]
+ *   bun run review.ts /tmp/ctx.json                            # auto-pick meaty file
+ *   bun run review.ts /tmp/ctx.json apps/backend/seed.ts       # specific file
+ *   bun run review.ts /tmp/ctx.json --worktree /repos/myrepo   # set codex cwd
  *
  * Builds a Greptile-style per-file review prompt with all context lanes and
- * calls a local Ollama chat model (default: gemma4:31b) to generate the
- * review. Prints the raw response and a parsed JSON view.
+ * runs it through `codex` via the codex-companion task interface. Codex is
+ * the only LLM in the loop — Ollama is only used by `index.ts` for embeddings.
+ *
+ * The prompt instructs codex to write its review to <bundlePath>.review.md
+ * (so this script never has to parse codex stdout).
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, stat } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
 
 interface SemanticNeighbor { path: string; score: number; alsoIn: string[] }
 interface HopNode { path: string; via: string; viaSymbols: string[]; type: string }
@@ -44,11 +50,28 @@ interface Bundle {
   files: FileEntry[];
 }
 
-const OLLAMA_URL = process.env.OLLAMA_HOST || 'http://localhost:11434';
-const MODEL = process.env.REVIEW_MODEL || 'gemma4:31b';
+// ---------------------------------------------------------------------------
+// CLI parsing
+// ---------------------------------------------------------------------------
+const argv = process.argv.slice(2);
+let bundlePath = '';
+let targetArg = '';
+let worktree = process.cwd();
 
-const bundlePath = process.argv[2] ?? '/tmp/ctx-v7.json';
-const targetArg = process.argv[3];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i]!;
+  if (a === '--worktree') {
+    worktree = resolve(argv[++i] ?? '');
+  } else if (!bundlePath) {
+    bundlePath = a;
+  } else if (!targetArg) {
+    targetArg = a;
+  }
+}
+if (!bundlePath) {
+  console.error('usage: bun run review.ts <bundle.json> [file-path] [--worktree <path>]');
+  process.exit(2);
+}
 
 const bundle: Bundle = JSON.parse(await readFile(bundlePath, 'utf8'));
 
@@ -70,10 +93,14 @@ if (!file) {
 }
 if (!file) file = bundle.files[0]!;
 
-console.error(`[review] bundle : ${bundlePath}`);
-console.error(`[review] file   : ${file.path}`);
-console.error(`[review] model  : ${MODEL}`);
-console.error(`[review] lanes  : imports=${file.directImports.length} callers=${file.directCallers.length} fwdHops=${file.multiHop.forwardTiers.map((t) => t.length).join(',')} revHops=${file.multiHop.reverseTiers.map((t) => t.length).join(',')} neighbors=${file.semanticNeighbors.length}`);
+const outputPath = resolve(bundlePath + '.review.md');
+const promptPath = resolve(bundlePath + '.review.prompt.md');
+
+console.error(`[review] bundle  : ${bundlePath}`);
+console.error(`[review] file    : ${file.path}`);
+console.error(`[review] worktree: ${worktree}`);
+console.error(`[review] output  : ${outputPath}`);
+console.error(`[review] lanes   : imports=${file.directImports.length} callers=${file.directCallers.length} fwdHops=${file.multiHop.forwardTiers.map((t) => t.length).join(',')} revHops=${file.multiHop.reverseTiers.map((t) => t.length).join(',')} neighbors=${file.semanticNeighbors.length}`);
 
 // ---------------------------------------------------------------------------
 // Prompt construction — Greptile-style per-file review, all lanes included
@@ -119,168 +146,189 @@ function fmtNeighbors(neighbors: SemanticNeighbor[]): string {
 }
 
 function extractMemorySections(memory: string): string {
-  // Keep just the Rules + Suppressed patterns + Notes bullets for the prompt
   return memory
     .split('\n')
     .filter((l) => l.startsWith('- ') || /^##\s/.test(l))
     .join('\n');
 }
 
-const systemPrompt = `You are a senior code reviewer. Given a single file that was modified in a pull request, write a concise review focused on the most important issues.
-
-Respond ONLY with valid JSON matching this exact schema — no prose before or after:
-{
-  "summary": string,
-  "comments": [{ "line": number, "category": "logic"|"style"|"syntax", "body": string }]
-}
-
-Hard rules (all must be followed):
-- Only comment on the most pressing, objective issues. Most files need 0-2 comments. Zero comments is perfectly acceptable.
-- Never say "check", "verify", "consider", "ensure", "validate", "confirm".
-- Never describe what the change does — that's obvious from the diff.
-- Assume every design decision is deliberate. Don't suggest revisiting choices.
-- Assume imports, dependencies, and callers are correct — don't tell the user to inspect them.
-- Never recommend adding docstrings, logs, or comments unless something is actively wrong.
-- Each comment must cite a specific line number from the "File with line numbers" section.
-- Prefer logic issues (bugs, edge cases, race conditions) over style.
-
-The user will ALSO provide a Review Memory with team-specific rules and suppressions. Follow the rules and NEVER violate the suppressions.`;
-
 const memoryBlock = bundle.memory ? extractMemorySections(bundle.memory.content) : '(no memory)';
 const ruleBlock = Object.entries(bundle.rules)
   .map(([k, v]) => `### ${k}\n${v.slice(0, 800)}`)
   .join('\n\n');
 
-// Truncate fullContent if very large to fit context
 const MAX_BODY_CHARS = 14000;
 let body = file.fullContent;
 if (body.length > MAX_BODY_CHARS) {
   body = body.slice(0, MAX_BODY_CHARS) + '\n... [truncated for context window]';
 }
 
-const userPrompt = `Repository: ${bundle.meta.repo}
-Base: ${bundle.meta.base}
-PR scope: ${bundle.meta.changedFileCount} files changed
+const prompt = `# Codex instructions — single-file PR review
 
-=== Review Memory (team preferences) ===
+You are a senior code reviewer doing a focused review of ONE file from a pull
+request. The bundle below contains every context lane the reviewer normally
+gets: extracted symbols, direct imports, callers, multi-hop forward/reverse
+graph, semantic neighbors, sibling files in the PR, the diff, and the full
+file body with line numbers.
+
+You may freely \`grep\`/\`rg\`/\`cat\` the actual repo at your cwd to verify
+hypotheses and trace symbols beyond what's inlined here. You may NOT edit any
+file other than the single output markdown file specified below.
+
+## cwd setup (do this first)
+
+\`\`\`bash
+cd "${worktree}"
+pwd
+\`\`\`
+
+## Output
+
+When you are done, write your review as plain markdown to:
+
+  \`${outputPath}\`
+
+Format:
+
+\`\`\`markdown
+# Review: ${file.path}
+
+## Summary
+[1-3 sentence summary of what the change is and your overall take]
+
+## Findings
+
+- L<num> [logic|contract|style] — short finding
+  Optional walkthrough or suggestion block...
+
+- L<num> ...
+\`\`\`
+
+## Hard rules
+
+- Most files need 0-3 findings. Zero findings is acceptable.
+- Each finding must cite a specific line number from the "File body" section.
+- Prefer logic / contract / concurrency issues over style.
+- Never recommend adding docstrings, logs, or comments unless something is
+  actively wrong.
+- Follow the project rules and review memory below; never violate suppressions.
+
+# Repository
+
+- Repo: ${bundle.meta.repo}
+- Base: ${bundle.meta.base}
+- PR scope: ${bundle.meta.changedFileCount} files changed
+
+# Review memory (team preferences)
+
 ${memoryBlock}
 
-=== Project rules ===
+# Project rules
+
 ${ruleBlock}
 
-=== File under review ===
-Path: ${file.path}
+# File under review
+
+Path: \`${file.path}\`
 Status: ${file.status} (+${file.additions} / -${file.deletions})
-${file.prevPath ? `Renamed from: ${file.prevPath}` : ''}
+${file.prevPath ? `Renamed from: \`${file.prevPath}\`\n` : ''}
 
-=== Extracted symbols ===
-exports:   ${file.symbols.exports.join(', ') || '(none)'}
-functions: ${file.symbols.functions.join(', ') || '(none)'}
-classes:   ${file.symbols.classes.join(', ') || '(none)'}
+## Extracted symbols
 
-=== Direct dependencies (internal) ===
+- exports:   ${file.symbols.exports.join(', ') || '(none)'}
+- functions: ${file.symbols.functions.join(', ') || '(none)'}
+- classes:   ${file.symbols.classes.join(', ') || '(none)'}
+
+## Direct dependencies (internal)
+
 ${fmtImports(file.directImports)}
 
-=== Callers (who imports this file) ===
+## Callers (who imports this file)
+
 ${fmtCallers(file.directCallers)}
 
-=== 2-hop forward (reached through direct deps) ===
+## 2-hop forward (reached through direct deps)
+
 ${fmtHops(file.multiHop.forwardTiers)}
 
-=== 2-hop reverse (callers-of-callers) ===
+## 2-hop reverse (callers-of-callers)
+
 ${fmtHops(file.multiHop.reverseTiers)}
 
-=== Semantically similar files (embedding cosine) ===
+## Semantically similar files (embedding cosine)
+
 ${fmtNeighbors(file.semanticNeighbors)}
 
-=== Other files in this PR ===
+## Other files in this PR
+
 ${file.otherChangedFiles.slice(0, 15).join('\n') || '(none)'}
 
-=== Diff ===
+## Diff
+
+\`\`\`diff
 ${file.patch.slice(0, 6000)}${file.patch.length > 6000 ? '\n... [truncated]' : ''}
+\`\`\`
 
-=== File with line numbers ===
+## File body (with line numbers)
+
+\`\`\`
 ${body}
+\`\`\`
 
-Respond ONLY with the JSON review object.`;
+Now do the review and write your findings to \`${outputPath}\`.
+`;
 
-console.error(`[review] prompt bytes: system=${systemPrompt.length} user=${userPrompt.length} total≈${Math.round((systemPrompt.length + userPrompt.length) / 4)}t`);
+await writeFile(promptPath, prompt);
+
+console.error(`[review] prompt bytes: ${prompt.length}`);
+console.error(`[review] prompt file : ${promptPath}`);
+console.error('[review] invoking codex (this can take a few minutes)...');
 
 // ---------------------------------------------------------------------------
-// Call Ollama chat
+// Invoke codex via codex-companion task --prompt-file --write
 // ---------------------------------------------------------------------------
+const COMPANION = '/Users/barreloflube/.claude/plugins/cache/openai-codex/codex/1.0.2/scripts/codex-companion.mjs';
+
+// Best-effort: clear any stale output from a previous run
+try { await stat(outputPath); await writeFile(outputPath, ''); } catch { /* ok */ }
+
 const t0 = Date.now();
 
-console.error(`[review] calling ${MODEL}... (this can take several minutes for a 31B model)`);
-// Bun's fetch has a default 10s idle timeout via undici that kills long-running
-// Ollama generation calls. Pass an explicit AbortSignal with a large timeout.
-const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({
-    model: MODEL,
-    stream: false,
-    format: 'json',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user',   content: userPrompt },
-    ],
-    options: {
-      temperature: 0.2,
-      num_ctx: 16384,
-    },
-  }),
-  signal: AbortSignal.timeout(30 * 60 * 1000),
+await new Promise<void>((resolveP, rejectP) => {
+  const child = spawn('node', [
+    COMPANION, 'task',
+    '--prompt-file', promptPath,
+    '--cwd', worktree,
+    '--write',
+  ], {
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  child.on('error', rejectP);
+  child.on('exit', (code) => {
+    if (code === 0) resolveP();
+    else rejectP(new Error(`codex-companion task exited with ${code}`));
+  });
 });
 
-if (!res.ok) {
-  const t = await res.text().catch(() => '');
-  console.error(`[review] ollama ${res.status}: ${t.slice(0, 500)}`);
+const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+// Verify output file was written
+let outBytes = 0;
+try {
+  const s = await stat(outputPath);
+  outBytes = s.size;
+} catch {
+  console.error(`[review] WARNING: codex did not write expected output file ${outputPath}`);
   process.exit(1);
 }
 
-const data = (await res.json()) as {
-  message?: { content?: string };
-  total_duration?: number;
-  eval_count?: number;
-  prompt_eval_count?: number;
-};
-const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-const content = data.message?.content ?? '';
-
-console.error(`[review] done in ${elapsed}s — prompt=${data.prompt_eval_count ?? '?'}t  gen=${data.eval_count ?? '?'}t`);
+console.error(`[review] done in ${elapsed}s — output ${outBytes} bytes`);
 console.error();
+console.error('================================================================');
+console.error(`  REVIEW : ${file.path}`);
+console.error(`  ELAPSED: ${elapsed}s`);
+console.error(`  OUTPUT : ${outputPath}`);
+console.error('================================================================');
 
-console.log('===============================================================');
-console.log('  REVIEW TARGET :', file.path);
-console.log('  MODEL         :', MODEL);
-console.log('  ELAPSED       :', elapsed + 's');
-console.log('===============================================================');
-console.log();
-console.log('--- raw response ---');
-console.log(content);
-console.log();
-
-// Parse and pretty-print
-try {
-  const parsed = JSON.parse(content);
-  console.log('--- parsed ---');
-  console.log();
-  if (parsed.summary) {
-    console.log('SUMMARY:');
-    console.log('  ' + parsed.summary.split('\n').join('\n  '));
-    console.log();
-  }
-  if (Array.isArray(parsed.comments) && parsed.comments.length > 0) {
-    console.log(`COMMENTS (${parsed.comments.length}):`);
-    for (const c of parsed.comments) {
-      console.log(`  line ${c.line}  [${c.category}]`);
-      console.log('    ' + (c.body || '').split('\n').join('\n    '));
-      console.log();
-    }
-  } else {
-    console.log('COMMENTS: (none — "most files need 0-2 comments, zero is acceptable")');
-  }
-} catch (e) {
-  console.error('[review] response was not valid JSON:', (e as Error).message);
-}
+// Print the review to stdout for convenience
+console.log(await readFile(outputPath, 'utf8'));
